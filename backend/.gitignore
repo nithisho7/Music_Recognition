@@ -1,0 +1,9 @@
+﻿venv311/
+__pycache__/
+*.pyc
+*.pyo
+uploads/
+*.tmp
+features/feature_matrix.npy
+features/feature_stats.npz
+features/labels.json
