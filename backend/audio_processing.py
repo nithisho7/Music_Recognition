@@ -46,7 +46,7 @@ def _standardize_duration(y: np.ndarray, sr: int, target_seconds: float = TARGET
 
 
 def preprocess_audio(audio_path: str) -> tuple[np.ndarray, int]:
-    y, sr = librosa.load(audio_path, sr=None, mono=False)
+    y, sr = librosa.load(audio_path, sr=16000, mono=True)
     y = _to_mono(y)
     y = _trim_silence(y, sr)
     y = _normalize_volume(y)

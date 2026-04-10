@@ -1,0 +1,20 @@
+# Python
+backend/venv311/
+backend/__pycache__/
+*.pyc
+*.pyo
+*.db
+
+# Flutter
+flutter_app/build/
+flutter_app/.dart_tool/
+flutter_app/.idea/
+flutter_app/.vscode/
+
+# Android
+flutter_app/android/.gradle/
+flutter_app/android/app/build/
+
+# Misc
+.DS_Store
+Thumbs.db
