@@ -6,31 +6,23 @@ import tempfile
 import time
 from pathlib import Path
 
+import requests
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 
-from config import ALLOWED_EXTENSIONS
-from recognition_service import RecognitionService
-
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 logger = logging.getLogger(__name__)
-service = RecognitionService()
 
 app = Flask(__name__)
 CORS(app)
 
+AUDD_API_URL = os.getenv('AUDD_API_URL', 'https://api.audd.io/')
+AUDD_API_TOKEN = os.getenv('AUDD_API_TOKEN')
+ALLOWED_EXTENSIONS = {'.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac'}
+
 
 def _allowed_file(filename: str) -> bool:
     return Path(filename).suffix.lower() in ALLOWED_EXTENSIONS
-
-
-def _parse_optional_float(value: str | None) -> float | None:
-    if value is None or value == '':
-        return None
-    try:
-        return float(value)
-    except ValueError:
-        return None
 
 
 @app.get('/health')
@@ -40,17 +32,52 @@ def health() -> tuple[dict[str, str], int]:
 
 @app.post('/recognize')
 def recognize():
-    request_start = time.perf_counter()
+    start = time.perf_counter()
+
+    if not AUDD_API_TOKEN:
+        logger.error('recognition_config_error missing_audd_api_token=true')
+        return jsonify({
+            'status': 'error',
+            'song': None,
+            'artist': None,
+            'confidence': None,
+            'decision': 'RETRY',
+            'message': 'AudD API token is not configured.',
+        }), 500
 
     if 'audio' not in request.files:
-        return jsonify({'status': 'error', 'message': 'Missing file field: audio'}), 400
+        logger.info('recognition_bad_request reason=missing_audio_field')
+        return jsonify({
+            'status': 'error',
+            'song': None,
+            'artist': None,
+            'confidence': None,
+            'decision': 'RETRY',
+            'message': 'Missing file field: audio',
+        }), 400
 
     file = request.files['audio']
     if not file or not file.filename:
-        return jsonify({'status': 'error', 'message': 'No file uploaded'}), 400
+        logger.info('recognition_bad_request reason=empty_upload')
+        return jsonify({
+            'status': 'error',
+            'song': None,
+            'artist': None,
+            'confidence': None,
+            'decision': 'RETRY',
+            'message': 'No file uploaded',
+        }), 400
 
     if not _allowed_file(file.filename):
-        return jsonify({'status': 'error', 'message': 'Unsupported audio format'}), 400
+        logger.info('recognition_bad_request reason=unsupported_format filename=%s', file.filename)
+        return jsonify({
+            'status': 'error',
+            'song': None,
+            'artist': None,
+            'confidence': None,
+            'decision': 'RETRY',
+            'message': 'Unsupported audio format',
+        }), 400
 
     suffix = Path(file.filename).suffix.lower()
     temp_path: str | None = None
@@ -62,20 +89,110 @@ def recognize():
             file.save(temp_file.name)
             temp_path = temp_file.name
 
-        upload_time_ms = round((time.perf_counter() - request_start) * 1000.0, 2)
-        recording_time_ms = _parse_optional_float(request.form.get('recording_time_ms'))
-        response = service.recognize(
-            temp_path,
-            recording_time_ms=recording_time_ms,
-            upload_time_ms=upload_time_ms,
+        with open(temp_path, 'rb') as audio_file:
+            audd_response = requests.post(
+                AUDD_API_URL,
+                data={'api_token': AUDD_API_TOKEN},
+                files={'file': (file.filename, audio_file, file.mimetype or 'application/octet-stream')},
+                timeout=15,
+            )
+
+        audd_response.raise_for_status()
+        audd_payload = audd_response.json()
+
+        if audd_payload.get('status') != 'success':
+            error = audd_payload.get('error')
+            if isinstance(error, dict):
+                message = error.get('error_message') or error.get('message') or 'AudD API returned an error.'
+            elif isinstance(error, str) and error:
+                message = error
+            else:
+                message = 'AudD API returned an error.'
+            logger.error('recognition_provider_error provider=audd message=%s payload=%s', message, audd_payload)
+            return jsonify({
+                'status': 'error',
+                'song': None,
+                'artist': None,
+                'confidence': None,
+                'decision': 'RETRY',
+                'message': message,
+            }), 502
+
+        result = audd_payload.get('result')
+        if not result or not result.get('title'):
+            logger.info('recognition_no_result')
+            return jsonify({
+                'status': 'error',
+                'song': None,
+                'artist': None,
+                'confidence': None,
+                'decision': 'RETRY',
+                'message': 'No match found. Try again.',
+            }), 200
+
+        song = result.get('title')
+        artist = result.get('artist')
+        elapsed = round((time.perf_counter() - start) * 1000, 2)
+
+        logger.info(
+            'recognition_complete song=%s artist=%s time=%sms',
+            song,
+            artist,
+            elapsed,
         )
-        payload = response.to_dict()
-        return jsonify(payload), 200
+
+        return jsonify({
+            'status': 'success',
+            'song': song,
+            'artist': artist,
+            'confidence': 0.95,
+            'decision': 'AUTO_ADD',
+            'message': 'Song recognized.',
+        }), 200
+
+    except requests.Timeout:
+        logger.error('recognition_error reason=audd_timeout')
+        return jsonify({
+            'status': 'error',
+            'song': None,
+            'artist': None,
+            'confidence': None,
+            'decision': 'RETRY',
+            'message': 'AudD API request timed out. Please retry.',
+        }), 504
+
+    except ValueError as exc:
+        logger.error('recognition_error reason=invalid_audd_json message=%s', str(exc), exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'song': None,
+            'artist': None,
+            'confidence': None,
+            'decision': 'RETRY',
+            'message': 'AudD API returned invalid JSON.',
+        }), 502
+
+    except requests.RequestException as exc:
+        logger.error('recognition_error reason=audd_request_failed message=%s', str(exc), exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'song': None,
+            'artist': None,
+            'confidence': None,
+            'decision': 'RETRY',
+            'message': 'Unable to reach AudD API. Please retry.',
+        }), 502
 
     except Exception as exc:
-        elapsed = round(time.perf_counter() - request_start, 3)
-        service.log_exception(processing_time=elapsed, message=str(exc))
-        return jsonify({'status': 'error', 'message': str(exc)}), 500
+        logger.error('recognition_error reason=unexpected message=%s', str(exc), exc_info=True)
+        return jsonify({
+            'status': 'error',
+            'song': None,
+            'artist': None,
+            'confidence': None,
+            'decision': 'RETRY',
+            'message': 'Recognition failed unexpectedly.',
+        }), 500
 
     finally:
         if temp_path and os.path.exists(temp_path):
